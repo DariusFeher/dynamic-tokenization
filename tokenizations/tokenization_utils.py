@@ -1,31 +1,40 @@
+"""
+Tokenization utilities
+
+This module provides the DatasetEncoder class for encoding datasets with different tokenization strategies,
+including dynamic tokenization or original tokenization with original embeddings or hypernetwork-based.
+
+Main class:
+    - DatasetEncoder: Encodes datasets for NLI, NER, and MMLU tasks using dynamic or static tokenization, with support for hypernet embeddings and caching.
+"""
+
+import time
+import random
+import numpy as np
 import torch
-from typing import Dict
+from typing import Dict, Tuple, List, Set, Any
 from tqdm import tqdm
 
-from tokenizations.hypernet_cache import LRU_Cache
-from datasets.formatting.formatting import LazyBatch
-
-from typing import Dict, Tuple
-
-from zett.utils import get_surface_form_matrix
-from tokenizations.dynamic_bpe import Dynamic_BPE
 from datasets import Dataset
-import numpy as np
-import time
+from datasets.formatting.formatting import LazyBatch
+from tokenizations.hypernet_cache import LRU_Cache
+from tokenizations.dynamic_bpe import Dynamic_BPE
 from tokenizations.tokenizers_utils import tokenize, pretokenize
-
-import random
+from zett.utils import get_surface_form_matrix
 
 
 class DatasetEncoder:
+    """
+    Encodes datasets for NLI, NER, and MMLU tasks using various tokenization strategies, including dynamic BPE and hypernetwork embeddings.
+    """
     def __init__(
         self,
-        tokenizer,
-        hypernet=None,
+        tokenizer: Any,
+        hypernet: Any = None,
         device: str = "cpu",
         lang_index: int = 0,
         surface_form_maxlen: int = 4,
-        source_embeddings: torch.tensor = torch.tensor([]),
+        source_embeddings: torch.Tensor = torch.tensor([]),
         embeddings_cache: LRU_Cache = None,
         exp_type: str = "",
         bpe_tokenizer_boundary: str = "pretokens",
@@ -50,72 +59,63 @@ class DatasetEncoder:
             tokenizer=self.tokenizer, tokenizer_boundary=self.bpe_tokenizer_boundary
         )
 
-    def reset_state(self, embeddings_cache: torch.tensor):
-        self.seq_lengths = []
-        self.tokens_processed_per_batch = []
-        self.unique_tokens_per_batch = []
-        self.embeddings_cache = embeddings_cache
-
-    def compute_tokens_batch_embeddings(self, unique_tokens: set, task: str) -> None:
-        tokens_to_process = [
-            token
-            for token in unique_tokens
-            if token not in self.embeddings_cache.token2idx
-        ]
-        tokens_to_move_to_end = unique_tokens - set(tokens_to_process)
-
-        nr_tokens_to_process = len(tokens_to_process)
-        new_cache_size = self.embeddings_cache.size + nr_tokens_to_process
-
-        if new_cache_size > self.embeddings_cache.capacity:
-            self.embeddings_cache.evict_with_exceptions(
-                unique_tokens, new_cache_size - self.embeddings_cache.capacity
+    def encode_dataset(
+        self,
+        dataset: Dataset,
+        batch_size: int = 32,
+        max_length: int = 128,
+        merges: int = 0,
+        task: str = "nli",
+        label_all_tokens: bool = False,
+        label_to_id: List = [],
+        b_to_i_label: List = [],
+    ) -> Tuple[Dataset, float]:
+        """
+        Encode a dataset in batches for a given task (NLI, NER, or MMLU).
+        Returns the encoded dataset (and the total encoding time).
+        """
+        batched_results = []
+        start_time = time.time()
+        for i in tqdm(range(0, len(dataset), batch_size), desc="Encoding Dataset"):
+            batch = dataset[i : i + batch_size]
+            encoded_batch = self.encode_examples_unique_tokens_lru(
+                batch,
+                max_length=max_length,
+                merges=merges,
+                task=task,
+                label_all_tokens=label_all_tokens,
+                label_to_id=label_to_id,
+                b_to_i_label=b_to_i_label,
             )
+            if task == "nli":
+                encoded_batch["label"] = torch.tensor(
+                    batch["label"], device=self.device
+                )
+            batched_results.append(encoded_batch)
+        end_time = time.time()
+        encoding_time = end_time - start_time
+        if task == "nli":
+            combined_batches = {
+                "inputs_embeds": torch.cat(
+                    [batch["inputs_embeds"] for batch in batched_results]
+                ),
+                "attention_mask": torch.cat(
+                    [batch["attention_mask"] for batch in batched_results]
+                ),
+                "label": torch.cat([batch["label"] for batch in batched_results]),
+            }
+        elif task == "ner":
+            combined_batches = {
+                "inputs_embeds": torch.cat(
+                    [batch["inputs_embeds"] for batch in batched_results]
+                ),
+                "attention_mask": torch.cat(
+                    [batch["attention_mask"] for batch in batched_results]
+                ),
+                "labels": torch.cat([batch["labels"] for batch in batched_results]),
+            }
+        return Dataset.from_dict(combined_batches), encoding_time
 
-        if tokens_to_process:
-            if self.collect_extra_data:
-                self.tokens_processed_per_batch.append(nr_tokens_to_process)
-                self.unique_tokens_per_batch.append(len(unique_tokens))
-
-            surface_forms, _ = get_surface_form_matrix(
-                tokens_to_process,
-                self.surface_form_maxlen,
-                tokenizer_to_use=self.tokenizer,
-                verbose=False,
-            )
-            surface_forms = torch.from_numpy(surface_forms).to(self.device)
-            special_tokens_mask = torch.isin(
-                surface_forms[:, 0],
-                torch.tensor(self.tokenizer.all_special_ids, device=self.device),
-            )
-
-            assert str(self.device) in str(
-                surface_forms.device
-            ), f"Device does not match: {surface_forms.device} different than {self.device}"
-            assert str(self.device) in str(
-                self.lang_index.device
-            ), f"Device does not match: {self.lang_index.device} different than {self.device}"
-            assert str(self.device) in str(
-                self.source_embeddings.device
-            ), f"Device does not match: {self.source_embeddings.device} different than {self.device}"
-
-            hypernet_preds, _, bias = self.hypernet(
-                surface_forms,
-                lang_index=self.lang_index,
-                source_embeddings=self.source_embeddings,
-            )
-            if task != "mmlu":
-                hypernet_preds[special_tokens_mask] = self.source_embeddings[
-                    surface_forms[special_tokens_mask, 0]
-                ]
-            else:
-                # Should be 4096 for Mistral. If this is not set, for special tokens we have embeddings of shape (1, 8192) and (1, 4096) for the rest of the tokens. This is because the source embeddings are concatenated
-                hypernet_preds[special_tokens_mask] = self.source_embeddings[
-                    surface_forms[special_tokens_mask, 0], : hypernet_preds.shape[1]
-                ]
-            self.embeddings_cache.put(tokens_to_process, hypernet_preds)
-        self.embeddings_cache.move_tokens_to_end(tokens_to_move_to_end)
-        
     def encode_examples_unique_tokens_lru(
         self,
         examples: LazyBatch,
@@ -128,16 +128,16 @@ class DatasetEncoder:
         b_to_i_label: list = [],
     ) -> Dict[str, torch.Tensor]:
         """
-        Function for encoding a batch for either NLI or NER task.
+        Encode a batch for NLI, NER, or MMLU using dynamic BPE if specified.
+        Returns a dictionary with embeddings, attention masks, and (optionally) labels.
         """
         batch_tokens = []
         unique_tokens = set()
         sequence_batch_embeddings = []
         attention_masks = []
         batch_word_ids = []
-        merges = self.merges if self.merges != None else merges
+        merges = self.merges if self.merges is not None else merges
         max_batch_length = 0
-
         with torch.no_grad():
             if self.exp_type == "dynamic_bpe" or self.exp_type == "fvt_dynamic_bpe":
                 ner = task == "ner"
@@ -160,106 +160,75 @@ class DatasetEncoder:
                     max_batch_length = max(len(sample), max_batch_length)
             else:
                 if task == "nli":
+                    def process_example(premise, hypothesis):
+                        if self.exp_type == "original_tk_hypernet":
+                            tokens = (
+                                ["<s>"]
+                                + tokenize(premise, self.tokenizer)
+                                + ["</s>", "</s>"]
+                                + tokenize(hypothesis, self.tokenizer)
+                                + ["</s>"]
+                            )
+                        elif self.exp_type in {"word_tk_hypernet", "fvt", "dynamic_bpe"}:
+                            tokens = (
+                                ["<s>"]
+                                + pretokenize(premise, self.tokenizer)
+                                + ["</s>", "</s>"]
+                                + pretokenize(hypothesis, self.tokenizer)
+                                + ["</s>"]
+                            )
+                        else:
+                            raise ValueError(f"Unknown exp_type: {self.exp_type}")
+                        return tokens
+
                     if isinstance(examples, list):
                         for batch_example in examples:
-                            if self.exp_type == "original_tk_hypernet":
-                                tokens = (
-                                    ["<s>"]
-                                    + tokenize(batch_example["premise"], self.tokenizer)
-                                    + ["</s>", "</s>"]
-                                    + tokenize(
-                                        batch_example["hypothesis"], self.tokenizer
-                                    )
-                                    + ["</s>"]
-                                )
-                            elif (
-                                self.exp_type == "word_tk_hypernet"
-                                or self.exp_type == "fvt"
-                                or self.exp_type == "dynamic_bpe"
-                            ):
-                                tokens = (
-                                    ["<s>"]
-                                    + pretokenize(
-                                        batch_example["premise"], self.tokenizer
-                                    )
-                                    + ["</s>", "</s>"]
-                                    + pretokenize(
-                                        batch_example["hypothesis"], self.tokenizer
-                                    )
-                                    + ["</s>"]
-                                )
+                            tokens = process_example(
+                                batch_example["premise"], batch_example["hypothesis"]
+                            )
                             if self.collect_extra_data:
                                 self.seq_lengths.append(len(tokens))
                             unique_tokens.update(tokens)
                             batch_tokens.append(tokens)
                     else:
-                        for idx, _ in enumerate(examples["premise"]):
+                        for idx in range(len(examples["premise"])):
                             random.seed(42)
-                            if self.exp_type == "original_tk_hypernet":
-                                tokens = (
-                                    ["<s>"]
-                                    + tokenize(examples["premise"][idx], self.tokenizer)
-                                    + ["</s>", "</s>"]
-                                    + tokenize(
-                                        examples["hypothesis"][idx], self.tokenizer
-                                    )
-                                    + ["</s>"]
-                                )
-
-                            elif (
-                                self.exp_type == "word_tk_hypernet"
-                                or self.exp_type == "fvt"
-                                or self.exp_type == "dynamic_bpe"
-                            ):
-                                tokens = (
-                                    ["<s>"]
-                                    + pretokenize(
-                                        examples["premise"][idx], self.tokenizer
-                                    )
-                                    + ["</s>", "</s>"]
-                                    + pretokenize(
-                                        examples["hypothesis"][idx], self.tokenizer
-                                    )
-                                    + ["</s>"]
-                                )
-
+                            tokens = process_example(
+                                examples["premise"][idx], examples["hypothesis"][idx]
+                            )
                             if self.collect_extra_data:
                                 self.seq_lengths.append(len(tokens))
                             unique_tokens.update(tokens)
                             batch_tokens.append(tokens)
                 elif task == "ner":
+                    def process_ner_example(tokens_list):
+                        tokens = ["<s>"]
+                        word_ids = [None]
+                        if self.exp_type == "original_tk_hypernet":
+                            for word_index, word in enumerate(tokens_list):
+                                subtokens = self.tokenizer.tokenize(
+                                    word, max_length=max_length
+                                )
+                                tokens.extend(subtokens)
+                                word_ids.extend([word_index] * len(subtokens))
+                        elif self.exp_type in {"word_tk_hypernet", "fvt"}:
+                            for word_index, word in enumerate(tokens_list):
+                                pretokens = pretokenize(
+                                    word, tokenizer=self.tokenizer
+                                )
+                                tokens.extend(pretokens)
+                                word_ids.extend([word_index] * len(pretokens))
+                        # Truncate if necessary, reserving space for </s>
+                        if len(tokens) >= max_length:
+                            tokens = tokens[: max_length - 1]
+                            word_ids = word_ids[: max_length - 1]
+                        tokens.append("</s>")
+                        word_ids.append(None)
+                        return tokens, word_ids
+
                     if isinstance(examples, list):
                         for batch_example in examples:
-                            tokens = ["<s>"]
-                            word_ids = [None]
-                            if self.exp_type == "original_tk_hypernet":
-                                for word_index, word in enumerate(
-                                    batch_example["tokens"]
-                                ):
-                                    subtokens = self.tokenizer.tokenize(
-                                        word, max_length=max_length
-                                    )
-                                    tokens.extend(subtokens)
-                                    word_ids.extend([word_index] * len(subtokens))
-                            elif (
-                                self.exp_type == "word_tk_hypernet"
-                                or self.exp_type == "fvt"
-                            ):
-                                for word_index, word in enumerate(
-                                    batch_example["tokens"]
-                                ):
-                                    pretokens = pretokenize(
-                                        word, tokenizer=self.tokenizer
-                                    )
-                                    tokens.extend(pretokens)
-                                    word_ids.extend([word_index] * len(pretokens))
-
-                            if len(tokens) >= max_length:
-                                tokens = tokens[: max_length - 1]
-                                word_ids = word_ids[: max_length - 1]
-                            tokens.append("</s>")
-                            word_ids.append(None)
-
+                            tokens, word_ids = process_ner_example(batch_example["tokens"])
                             if self.collect_extra_data:
                                 self.seq_lengths.append(len(tokens))
                             unique_tokens.update(tokens)
@@ -267,35 +236,7 @@ class DatasetEncoder:
                             batch_word_ids.append(word_ids)
                     else:
                         for idx, _ in enumerate(examples["tokens"]):
-                            tokens = ["<s>"]
-                            word_ids = [None]
-                            if self.exp_type == "original_tk_hypernet":
-                                for word_index, word in enumerate(
-                                    examples["tokens"][idx]
-                                ):
-                                    subtokens = self.tokenizer.tokenize(
-                                        word, max_length=max_length
-                                    )
-                                    tokens.extend(subtokens)
-                                    word_ids.extend([word_index] * len(subtokens))
-                            elif (
-                                self.exp_type == "word_tk_hypernet"
-                                or self.exp_type == "fvt"
-                            ):
-                                for word_index, word in enumerate(
-                                    examples["tokens"][idx]
-                                ):
-                                    pretokens = pretokenize(
-                                        word, tokenizer=self.tokenizer
-                                    )
-                                    tokens.extend(pretokens)
-                                    word_ids.extend([word_index] * len(pretokens))
-                            if len(tokens) >= max_length:
-                                tokens = tokens[: max_length - 1]
-                                word_ids = word_ids[: max_length - 1]
-                            tokens.append("</s>")
-                            word_ids.append(None)
-
+                            tokens, word_ids = process_ner_example(examples["tokens"][idx])
                             if self.collect_extra_data:
                                 self.seq_lengths.append(len(tokens))
                             unique_tokens.update(tokens)
@@ -464,65 +405,10 @@ class DatasetEncoder:
                 "labels": torch.stack(labels).to(self.device),
             }
 
-    def encode_dataset(
-        self,
-        dataset: Dataset,
-        batch_size: int = 32,
-        max_length: int = 128,
-        merges: int = 0,
-        task: str = "nli",
-        label_all_tokens: bool = False,
-        label_to_id: list = [],
-        b_to_i_label: list = [],
-    ) -> Tuple[Dataset, float]:
-        batched_results = []
-        start_time = time.time()
-
-        for i in tqdm(range(0, len(dataset), batch_size), desc="Encoding Dataset"):
-            batch = dataset[i : i + batch_size]
-            encoded_batch = self.encode_examples_unique_tokens_lru(
-                batch,
-                max_length=max_length,
-                merges=merges,
-                task=task,
-                label_all_tokens=label_all_tokens,
-                label_to_id=label_to_id,
-                b_to_i_label=b_to_i_label,
-            )
-            if task == "nli":
-                encoded_batch["label"] = torch.tensor(
-                    batch["label"], device=self.device
-                )
-            batched_results.append(encoded_batch)
-        end_time = time.time()
-        encoding_time = end_time - start_time
-        if task == "nli":
-            combined_batches = {
-                "inputs_embeds": torch.cat(
-                    [batch["inputs_embeds"] for batch in batched_results]
-                ),
-                "attention_mask": torch.cat(
-                    [batch["attention_mask"] for batch in batched_results]
-                ),
-                "label": torch.cat([batch["label"] for batch in batched_results]),
-            }
-        elif task == "ner":
-            combined_batches = {
-                "inputs_embeds": torch.cat(
-                    [batch["inputs_embeds"] for batch in batched_results]
-                ),
-                "attention_mask": torch.cat(
-                    [batch["attention_mask"] for batch in batched_results]
-                ),
-                "labels": torch.cat([batch["labels"] for batch in batched_results]),
-            }
-        return Dataset.from_dict(combined_batches), encoding_time
-
     def encode_examples_unique_tokens(self, examples, max_length=128, verbose=False):
         """
         Uses hypernet to predict embedding only for unique tokens rather than all the tokens in our batch sequences.
         """
-        # return self.tokenizer(examples['premise'], examples['hypothesis'], padding="max_length", truncation=True, max_length=max_length, return_tensors="pt")
         batch_tokens = []
         unique_tokens = set()
 
@@ -544,7 +430,6 @@ class DatasetEncoder:
                     + ["</s>"]
                 )
 
-            # Chose this over np.unique as I think it's more efficient (O(n + m) compared to O(n log n))
             unique_tokens = unique_tokens.union(set(tokens))
             if len(tokens) > max_length:
                 tokens = tokens[:max_length]
@@ -618,5 +503,69 @@ class DatasetEncoder:
             "inputs_embeds": torch.stack(embeddings_batch),
             "attention_mask": torch.stack(attention_masks_batch),
         }
-
         return result
+
+    def reset_state(self, embeddings_cache: torch.Tensor):
+        """
+        Reset the encoder's state and update the embeddings cache.
+        """
+        self.seq_lengths = []
+        self.tokens_processed_per_batch = []
+        self.unique_tokens_per_batch = []
+        self.embeddings_cache = embeddings_cache
+
+    def compute_tokens_batch_embeddings(self, unique_tokens: Set[str], task: str) -> None:
+        """
+        Compute and cache embeddings for a set of unique tokens using the hypernet.
+        """
+        tokens_to_process = [
+            token
+            for token in unique_tokens
+            if token not in self.embeddings_cache.token2idx
+        ]
+        tokens_to_move_to_end = unique_tokens - set(tokens_to_process)
+        nr_tokens_to_process = len(tokens_to_process)
+        new_cache_size = self.embeddings_cache.size + nr_tokens_to_process
+        if new_cache_size > self.embeddings_cache.capacity:
+            self.embeddings_cache.evict_with_exceptions(
+                unique_tokens, new_cache_size - self.embeddings_cache.capacity
+            )
+        if tokens_to_process:
+            if self.collect_extra_data:
+                self.tokens_processed_per_batch.append(nr_tokens_to_process)
+                self.unique_tokens_per_batch.append(len(unique_tokens))
+            surface_forms, _ = get_surface_form_matrix(
+                tokens_to_process,
+                self.surface_form_maxlen,
+                tokenizer_to_use=self.tokenizer,
+                verbose=False,
+            )
+            surface_forms = torch.from_numpy(surface_forms).to(self.device)
+            special_tokens_mask = torch.isin(
+                surface_forms[:, 0],
+                torch.tensor(self.tokenizer.all_special_ids, device=self.device),
+            )
+            assert str(self.device) in str(
+                surface_forms.device
+            ), f"Device does not match: {surface_forms.device} different than {self.device}"
+            assert str(self.device) in str(
+                self.lang_index.device
+            ), f"Device does not match: {self.lang_index.device} different than {self.device}"
+            assert str(self.device) in str(
+                self.source_embeddings.device
+            ), f"Device does not match: {self.source_embeddings.device} different than {self.device}"
+            hypernet_preds, _, bias = self.hypernet(
+                surface_forms,
+                lang_index=self.lang_index,
+                source_embeddings=self.source_embeddings,
+            )
+            if task != "mmlu":
+                hypernet_preds[special_tokens_mask] = self.source_embeddings[
+                    surface_forms[special_tokens_mask, 0]
+                ]
+            else:
+                hypernet_preds[special_tokens_mask] = self.source_embeddings[
+                    surface_forms[special_tokens_mask, 0], : hypernet_preds.shape[1]
+                ]
+            self.embeddings_cache.put(tokens_to_process, hypernet_preds)
+        self.embeddings_cache.move_tokens_to_end(tokens_to_move_to_end)

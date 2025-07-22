@@ -1,17 +1,32 @@
+"""
+Dynamic BPE Tokenizer
+
+Implements a dynamic tokenization for a batch using byte pair encoding (BPE)
+
+Public methods:
+    - tokenize_batch: Tokenize a batch with a given number of BPE merges to be applied (i.e., dynamic tokenization)
+    - get_merges2seqlen_for_dataset: Computes and saved # number of merges -> sequence reduction mapping for a given dataset (0% to 100% reduction)
+
+"""
 import pickle
-import string
 from collections import Counter, defaultdict
 from functools import lru_cache
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Set, Any
 
 from datasets.formatting.formatting import LazyBatch
 from tokenizations.tokenizers_utils import pretokenize, tokenize
 from tokenizers import pre_tokenizers
 from zett.utils import CHARS_TO_BYTES
 
-
 class Dynamic_BPE:
-    def __init__(self, tokenizer, tokenizer_boundary: str = "pretokens"):
+    """
+    Dynamic Byte Pair Encoding (BPE) tokenizer for dynamic tokenization experiments.
+
+    Args:
+        tokenizer: The base tokenizer object.
+        tokenizer_boundary (str): Boundary for merging subwords ('pretokens', 'words', 'sentence', etc.).
+    """
+    def __init__(self, tokenizer: Any, tokenizer_boundary: str = "pretokens"):
         self.tokenizer = tokenizer
         self.tokenizer_boundary = tokenizer_boundary
         self.special_token_map = set(tokenizer.special_tokens_map.values())
@@ -22,9 +37,136 @@ class Dynamic_BPE:
             and not any(char.isdigit() for char in token)
         }
         self.debug = False
+        self.merges2seqLen = {}  # Used for sequence length analysis
+
+    def tokenize_batch(
+        self,
+        batch_examples: LazyBatch,
+        max_nr_merges: int = 1000,
+        mlm: bool = False,
+        max_length: int = 1280,
+        ner: bool = False,
+        nli: bool = False,
+        mmlu: bool = False,
+    ):
+        """
+        Tokenize a batch of examples using dynamic BPE with a specified number of merges.
+        Returns tokenized sequences, unique tokens, sequence lengths, and (optionally) word ids.
+        """
+        unique_tokens_original, batch_tokens, batch_word_tokens, batch_word_ids = (
+            self.tokenize_base_case(
+                batch_examples=batch_examples,
+                mlm=mlm,
+                max_length=max_length,
+                ner=ner,
+                nli=nli,
+                mmlu=mmlu,
+            )
+        )
+        unique_tokens_bpe = set()
+        batch_seq_lengths = []
+        total_merges = 0
+        while total_merges < max_nr_merges:
+            best_pair = self.get_most_frequent_pair(batch_tokens=batch_tokens)
+            if best_pair == "":
+                print(f"Early exit, {total_merges} out of {max_nr_merges}")
+                break
+            total_merges += 1
+            batch_tokens, batch_word_ids = self.merge_pair(
+                a=best_pair[0],
+                b=best_pair[1],
+                batch_tokens=batch_tokens,
+                ner=ner,
+                batch_word_ids=batch_word_ids,
+            )
+        for tokenised_text in batch_tokens:
+            unique_tokens_bpe.update(tokenised_text)
+            batch_seq_lengths.append(len(tokenised_text))
+        if self.debug:
+            for i in range(32):
+                if i < len(batch_tokens) and batch_tokens[i] != batch_word_tokens[i]:
+                    print(i)
+                    print(batch_tokens[i])
+                    print(batch_word_tokens[i])
+        return batch_tokens, unique_tokens_bpe, batch_seq_lengths, batch_word_ids
+
+    def tokenize_batch_for_seq_len(
+        self,
+        batch_examples: LazyBatch,
+        max_nr_merges: int = 20000,
+        mlm: bool = False,
+        max_length: int = 128,
+        ner: bool = False,
+        nli: bool = False,
+        mmlu: bool = False,
+    ):
+        """
+        Analyze the distribution of merges to average sequence lengths for a dataset batch.
+        Populates self.merges2seqLen.
+        """
+        import copy
+        _, batch_tokens, _, _ = self.tokenize_base_case(
+            batch_examples=batch_examples,
+            mlm=False,
+            max_length=max_length,
+            ner=False,
+            nli=False,
+            mmlu=True,
+        )
+        total_merges = 0
+        if total_merges not in self.merges2seqLen:
+            self.merges2seqLen[total_merges] = 0
+        for tokenised_text in batch_tokens:
+            self.merges2seqLen[total_merges] += len(tokenised_text)
+        while total_merges < max_nr_merges:
+            best_pair = self.get_most_frequent_pair(batch_tokens=batch_tokens)
+            if best_pair == "":
+                for i in range(total_merges + 1, max_nr_merges):
+                    if i not in self.merges2seqLen:
+                        self.merges2seqLen[i] = 0
+                    for tokenised_text in batch_tokens:
+                        self.merges2seqLen[i] += len(tokenised_text)
+                break
+            total_merges += 1
+            batch_tokens, _ = self.merge_pair(
+                a=best_pair[0], b=best_pair[1], batch_tokens=batch_tokens
+            )
+            if total_merges not in self.merges2seqLen:
+                self.merges2seqLen[total_merges] = 0
+            for tokenised_text in batch_tokens:
+                self.merges2seqLen[total_merges] += len(tokenised_text)
+
+    def get_merges2seqlen_for_dataset(self, dataset, batch_size: int = 32) -> None:
+        """
+        Compute and save the mapping from number of merges to average sequence length for a dataset.
+        """
+        from tqdm import tqdm
+        self.merges2seqLen = {}
+        max_length = 8192  # Can be parameterized
+        for i in tqdm(range(0, len(dataset), batch_size), desc="Encoding Dataset"):
+            batch = dataset[i : i + batch_size]
+            self.tokenize_batch_for_seq_len(
+                batch_examples=batch,
+                max_nr_merges=100000,
+                mlm=False,
+                max_length=max_length,
+                ner=False,
+                nli=False,
+                mmlu=True,
+            )
+        for merge in self.merges2seqLen:
+            self.merges2seqLen[merge] = self.merges2seqLen[merge] / len(dataset)
+        print(self.merges2seqLen)
+        with open("MTBench100k_merges2SeqLen_v2_10k_128Batch_MADLAD.pkl", "wb") as f:
+            pickle.dump(self.merges2seqLen, f)
+
+    # === Helper methods ===
 
     @lru_cache(maxsize=None)
-    def is_valid_pair(self, pair):
+    def is_valid_pair(self, pair: Tuple[str, str]) -> bool:
+        """
+        Check if a pair of tokens can be merged, according to the current boundary and special token rules.
+        """
         token1, token2 = pair[0], pair[1]
         # merging can be problematic if the pair is not a valid utf-8 string
         # in particular, if a full word is followed by something which is not valid utf-8
@@ -81,8 +223,10 @@ class Dynamic_BPE:
             # this chunk of bytes is not a valid string, so we can't test it
             return True
 
-    # pre_tokenizers.ByteLevel(add_prefix_space=True, use_regex=False).pre_tokenize_str("asdf")
-    def get_most_frequent_pair(self, batch_tokens: Dict[str, int], check_valid=True):
+    def get_most_frequent_pair(self, batch_tokens: List[List[str]], check_valid: bool = True) -> Any:
+        """
+        Find the most frequent valid pair of tokens in the batch.
+        """
         pair_freqs = Counter()
         for token_sequence in batch_tokens:
             pairs = zip(token_sequence, token_sequence[1:])
@@ -96,8 +240,11 @@ class Dynamic_BPE:
         return ""
 
     def merge_pair(
-        self, a: str, b: str, batch_tokens, ner: bool = False, batch_word_ids: list = []
+        self, a: str, b: str, batch_tokens: List[List[str]], ner: bool = False, batch_word_ids: List[List[Any]] = []
     ):
+        """
+        Merge all occurrences of the pair (a, b) in the batch tokens.
+        """
         for idx, token_seq in enumerate(batch_tokens):
             i = 0
             new_token_seq = []
@@ -125,13 +272,17 @@ class Dynamic_BPE:
 
     def tokenize_base_case(
         self,
-        batch_examples,
+        batch_examples: Any,
         mlm: bool = False,
         max_length: int = 128,
         ner: bool = False,
         nli: bool = False,
         mmlu: bool = False,
     ):
+        """
+        Tokenize a batch using the base tokenizer, before any merges.
+        Returns unique tokens, batch tokens, batch word tokens, and batch word ids.
+        """
         assert not (mlm and ner)
         batch_tokens = []
         batch_word_tokens = []
@@ -210,15 +361,6 @@ class Dynamic_BPE:
                     )
                     batch_tokens.append(tokens)
                     unique_tokens_original.update(tokens)
-                    if self.debug:
-                        tokens_word = (
-                            ["<s>"]
-                            + pretokenize(batch_example["premise"], self.tokenizer)
-                            + ["</s>", "</s>"]
-                            + pretokenize(batch_example["hypothesis"], self.tokenizer)
-                            + ["</s>"]
-                        )
-                        batch_word_tokens.append(tokens_word)
             else:
                 for idx, _ in enumerate(batch_examples["premise"]):
                     tokens = (
@@ -230,19 +372,6 @@ class Dynamic_BPE:
                     )
                     batch_tokens.append(tokens)
                     unique_tokens_original.update(tokens)
-                    if self.debug:
-                        tokens_word = (
-                            ["<s>"]
-                            + pretokenize(
-                                batch_examples["premise"][idx], self.tokenizer
-                            )
-                            + ["</s>", "</s>"]
-                            + pretokenize(
-                                batch_examples["hypothesis"][idx], self.tokenizer
-                            )
-                            + ["</s>"]
-                        )
-                        batch_word_tokens.append(tokens_word)
         elif mlm:
             if isinstance(batch_examples, list):
                 for batch_example in batch_examples:
@@ -258,16 +387,8 @@ class Dynamic_BPE:
                     tokens = tokens[:max_length]
                     batch_tokens.append(tokens)
                     unique_tokens_original.update(tokens)
-                    if self.debug:
-                        tokens_word = (
-                            ["<s>"]
-                            + pretokenize(batch_example["text"], self.tokenizer)
-                            + ["</s>"]
-                        )
-                        batch_word_tokens.append(tokens_word)
             else:
                 for idx, _ in enumerate(batch_examples["text"]):
-                    print(idx)
                     tokens = (
                         ["<s>"]
                         + tokenize(
@@ -278,16 +399,12 @@ class Dynamic_BPE:
                         )
                         + ["</s>"]
                     )
-                    if self.debug:
-                        tokens_word = (
-                            ["<s>"]
-                            + pretokenize(batch_examples["text"][idx], self.tokenizer)
-                            + ["</s>"]
-                        )
-                        batch_word_tokens.append(tokens_word)
         return unique_tokens_original, batch_tokens, batch_word_tokens, batch_word_ids
 
-    def initialize_position_tracking(self, batch_tokens):
+    def initialize_position_tracking(self, batch_tokens: List[List[str]]):
+        """
+        Build a mapping from token pairs to their positions in the batch (for ner).
+        """
         token_positions = defaultdict(list)
         for idx, tokens in enumerate(batch_tokens):
             for pos in range(len(tokens) - 1):
@@ -297,12 +414,15 @@ class Dynamic_BPE:
 
     def merge_pair_with_tracking(
         self,
-        best_pair,
-        batch_tokens,
-        token_positions,
+        best_pair: Tuple[str, str],
+        batch_tokens: List[List[str]],
+        token_positions: Dict[Tuple[str, str], List[Tuple[int, int]]],
         ner: bool = False,
-        batch_word_ids: list = [],
+        batch_word_ids: List[List[Any]] = [],
     ):
+        """
+        Merge a pair in the batch tokens, updating position tracking.
+        """
         indices_to_merge = token_positions.pop(best_pair, [])
         new_pair = best_pair[0] + best_pair[1]
 
@@ -331,134 +451,3 @@ class Dynamic_BPE:
                 del batch_word_ids[idx][pos + 1]
 
         return batch_tokens, batch_word_ids, token_positions
-
-    def tokenize_batch(
-        self,
-        batch_examples: LazyBatch,
-        max_nr_merges: int = 1000,
-        mlm: bool = False,
-        max_length: int = 1280,
-        ner: bool = False,
-        nli: bool = False,
-        mmlu: bool = False,
-    ):
-        unique_tokens_original = set()
-        unique_tokens_bpe = set()
-        batch_tokens = []
-        batch_word_tokens = []
-        batch_seq_lengths = []
-        total_merges = 0
-
-        unique_tokens_original, batch_tokens, batch_word_tokens, batch_word_ids = (
-            self.tokenize_base_case(
-                batch_examples=batch_examples,
-                mlm=mlm,
-                max_length=max_length,
-                ner=ner,
-                nli=nli,
-                mmlu=mmlu,
-            )
-        )
-        while total_merges < max_nr_merges:
-            best_pair = self.get_most_frequent_pair(batch_tokens=batch_tokens)
-            if best_pair == "":
-                print(f"Early exit, {total_merges} out of {max_nr_merges}")
-                break
-
-            total_merges += 1
-            batch_tokens, batch_word_ids = self.merge_pair(
-                a=best_pair[0],
-                b=best_pair[1],
-                batch_tokens=batch_tokens,
-                ner=ner,
-                batch_word_ids=batch_word_ids,
-            )
-
-        for _, tokenised_text in enumerate(batch_tokens):
-            unique_tokens_bpe.update(tokenised_text)
-            batch_seq_lengths.append(len(tokenised_text))
-
-        if self.debug:
-            for i in range(32):
-                if i < len(batch_tokens) and batch_tokens[i] != batch_word_tokens[i]:
-                    print(i)
-                    print(batch_tokens[i])
-                    print(batch_word_tokens[i])
-        return batch_tokens, unique_tokens_bpe, batch_seq_lengths, batch_word_ids
-
-    def tokenize_batch_for_seq_len(
-        self,
-        batch_examples: LazyBatch,
-        max_nr_merges: int = 20000,
-        mlm: bool = False,
-        max_length: int = 128,
-        ner: bool = False,
-        nli: bool = False,
-        mmlu: bool = False,
-    ):
-        """Method used to find the distribution of merges to average sequence lengths for a dataset, using different numbers of merges"""
-        batch_tokens = []
-        total_merges = 0
-
-        _, batch_tokens, _, _ = self.tokenize_base_case(
-            batch_examples=batch_examples,
-            mlm=False,
-            max_length=max_length,
-            ner=False,
-            nli=False,
-            mmlu=True,
-        )
-        import copy
-
-        init_batch_tokens = copy.deepcopy(batch_tokens)
-        if total_merges not in self.merges2seqLen:
-            self.merges2seqLen[total_merges] = 0
-
-        for _, tokenised_text in enumerate(batch_tokens):
-            self.merges2seqLen[total_merges] += len(tokenised_text)
-
-        while total_merges < max_nr_merges:
-            best_pair = self.get_most_frequent_pair(batch_tokens=batch_tokens)
-            if best_pair == "":
-                for i in range(total_merges + 1, max_nr_merges):
-                    if i not in self.merges2seqLen:
-                        self.merges2seqLen[i] = 0
-                    for _, tokenised_text in enumerate(batch_tokens):
-                        self.merges2seqLen[i] += len(tokenised_text)
-                break
-
-            total_merges += 1
-            batch_tokens, _ = self.merge_pair(
-                a=best_pair[0], b=best_pair[1], batch_tokens=batch_tokens
-            )
-
-            if total_merges not in self.merges2seqLen:
-                self.merges2seqLen[total_merges] = 0
-            for _, tokenised_text in enumerate(batch_tokens):
-                self.merges2seqLen[total_merges] += len(tokenised_text)
-
-    def get_merges2seqlen_for_dataset(self, dataset, batch_size: int = 32) -> None:
-        """Useful for plotting"""
-        from tqdm import tqdm
-
-        self.merges2seqLen = {}
-        max_length = 8192  # OVERWRITE THIS
-        for i in tqdm(range(0, len(dataset), batch_size), desc="Encoding Dataset"):
-            batch = dataset[i : i + batch_size]
-            self.tokenize_batch_for_seq_len(
-                batch_examples=batch,
-                max_nr_merges=100000,
-                mlm=False,
-                max_length=max_length,
-                ner=False,
-                nli=False,
-                mmlu=True,
-            )
-
-        for merge in self.merges2seqLen:
-            self.merges2seqLen[merge] = self.merges2seqLen[merge] / len(dataset)
-
-        print(self.merges2seqLen)
-
-        with open("MTBench100k_merges2SeqLen_v2_10k_128Batch_MADLAD.pkl", "wb") as f:
-            pickle.dump(self.merges2seqLen, f)

@@ -32,6 +32,7 @@ def get_hypernet(device: str):
     )
     return hypernet.to(device)
 
+
 def get_model_from_mlm_with_adapter(
     exp_type: str,
     adapter_path: str,

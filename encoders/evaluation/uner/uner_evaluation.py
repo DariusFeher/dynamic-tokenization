@@ -1,3 +1,17 @@
+"""
+UNER Evaluation Script
+
+Functionality:
+- Supports different tokenization strategies (original = plain, original_tk_hypernet = 
+original tokenization with hypernetwork embeddings, word_tk_hypernet = word tokenization 
+with hypernetwork embeddings, dynamic_bpe = dynamic tokenization with hypernetwork embeddings, etc.).
+- Loads and evaluates models with or without adapters, including PEFT and merged adapters.
+- Logs results and statistics to Weights & Biases (wandb) if enabled.
+
+Usage:
+    python3 encoders/evaluation/uner/uner_evaluation.py --exp_type $exp_type [...] - see below the full list or args
+
+"""
 import argparse
 import os
 import time
@@ -15,6 +29,7 @@ from encoders.evaluation.evaluation_utils import (evaluate_ner, get_dataset, get
 from tokenizations.hypernet_cache import LRU_Cache
 from tokenizations.tokenization_utils import DatasetEncoder
 from tokenizations.tokenizers_utils import to_longest_prefix_tokenizer
+from encoders.evaluation.uner.uner_utils import encode_examples_plain
 
 parser = argparse.ArgumentParser(description="Running Dynamic Tokenization Experiments")
 parser.add_argument(
@@ -97,7 +112,6 @@ mlm_model_path = args.mlm_model_path
 seq_lengths = []
 tokens_processed_per_batch = []
 unique_tokens_per_batch = []
-
 
 
 dataset_split = ""
@@ -195,59 +209,6 @@ examples = pd.DataFrame(validation)
 examples.head()
 
 label_list = validation.features["ner_tags"].feature.names
-
-
-def encode_examples_plain(examples, label_all_tokens=False):
-    tokenized_inputs = tokenizer(
-        examples["tokens"],
-        padding="max_length",
-        truncation=True,
-        max_length=128,
-        # We use this argument because the texts in our dataset are lists of words (with a label for each word).
-        is_split_into_words=True,
-        return_tensors="pt",
-    )
-    labels = []
-
-    label_list = validation.features["ner_tags"].feature.names
-    label_to_id = {i: i for i in range(len(label_list))}
-    b_to_i_label = []
-    for idx, label in enumerate(label_list):
-        if label.startswith("B-") and label.replace("B-", "I-") in label_list:
-            b_to_i_label.append(label_list.index(label.replace("B-", "I-")))
-        else:
-            b_to_i_label.append(idx)
-
-    for i, label in enumerate(examples["ner_tags"]):
-        word_ids = tokenized_inputs.word_ids(batch_index=i)
-        previous_word_idx = None
-        label_ids = []
-        for word_idx in word_ids:
-            # Special tokens have a word id that is None. We set the label to -100 so they are automatically
-            # ignored in the loss function.
-            if word_idx is None:
-                label_ids.append(-100)
-            # We set the label for the first token of each word.
-            elif word_idx != previous_word_idx:
-                label_ids.append(label_to_id[label[word_idx]])
-            # For the other tokens in a word, we set the label to either the current label or -100, depending on
-            # the label_all_tokens flag.
-            else:
-                if label_all_tokens:
-                    label_ids.append(b_to_i_label[label_to_id[label[word_idx]]])
-                else:
-                    label_ids.append(-100)
-            previous_word_idx = word_idx
-
-        labels.append(label_ids)
-    tokenized_inputs["labels"] = labels
-
-    return tokenized_inputs
-
-
-print("Check language:", validation[0])
-
-
 # Required for encoding the dataset/batches
 label_to_id = {i: i for i in range(len(label_list))}
 b_to_i_label = []
@@ -280,12 +241,9 @@ elif exp_type in ["original_tk_hypernet", "word_tk_hypernet", "fvt"] or (
         label_to_id=label_to_id,
         b_to_i_label=b_to_i_label,
     )
-    # encoding_time = 0
-    # encoded_val = validation.map(datasetEncoder.encode_examples_unique_tokens_lru, batched=True, batch_size=32)
     encoded_val.set_format(
         type="torch", columns=["inputs_embeds", "attention_mask", "labels"]
     )
-
 
 if exp_type != "dynamic_bpe" or (exp_type == "dynamic_bpe" and not multiple_merges_exp):
     precision, recall, f1_score, overall_accuracy = evaluate_ner(
@@ -329,8 +287,6 @@ else:
                 b_to_i_label=b_to_i_label,
             )
 
-            # encoded_val, encoding_time = datasetEncoder.encode_dataset(
-            #     dataset=validation, batch_size=batch_size, merges=merges)
             encoded_val.set_format(
                 type="torch", columns=["inputs_embeds", "attention_mask", "labels"]
             )

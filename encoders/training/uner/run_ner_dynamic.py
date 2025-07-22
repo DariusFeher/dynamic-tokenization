@@ -15,6 +15,8 @@
 # limitations under the License.
 """
 Fine-tuning the library models for token classification.
+
+This script has been adapted to support dynamic tokenization with hypernetwork embeddings.
 """
 # You can also adapt this script on your own token classification task and datasets. Pointers for this are left as
 # comments.

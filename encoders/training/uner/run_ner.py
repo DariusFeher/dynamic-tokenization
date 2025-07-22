@@ -15,6 +15,8 @@
 # limitations under the License.
 """
 Fine-tuning the library models for token classification.
+
+This script uses original tokenization with original embeddings for fine-tuning.
 """
 # You can also adapt this script on your own token classification task and datasets. Pointers for this are left as
 # comments.

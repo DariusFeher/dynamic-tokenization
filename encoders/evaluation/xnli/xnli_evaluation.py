@@ -1,3 +1,17 @@
+"""
+XNLI Evaluation Script
+
+Functionality:
+- Supports different tokenization strategies (original = plain, original_tk_hypernet = 
+original tokenization with hypernetwork embeddings, word_tk_hypernet = word tokenization 
+with hypernetwork embeddings, dynamic_bpe = dynamic tokenization with hypernetwork embeddings, etc.).
+- Loads and evaluates models with or without adapters, including PEFT and merged adapters.
+- Logs results and statistics to Weights & Biases (wandb) if enabled.
+
+Usage:
+    python3 encoders/evaluation/xnli/xnli_evaluation.py --exp_type $exp_type [...] - see below the full list or args
+
+"""
 import argparse
 import os
 import time

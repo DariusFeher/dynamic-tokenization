@@ -2,8 +2,14 @@
 
 Usage:
 python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
+
+Note:
+- The `get_model_answers` function has been modified to support answer generation using dynamic 
+tokenization (dynamic BPE merges) with hypernetwork embeddings.
 """
 
+from tokenizations.hypernet_cache import LRU_Cache
+from tokenizations.tokenization_utils import DatasetEncoder
 import faiss
 import argparse
 import json
@@ -34,8 +40,6 @@ from tqdm import tqdm
 HOME_PATH = "/mnt/nas_home/dmf45/dynamic_tokenization"
 sys.path.insert(0, HOME_PATH)
 
-from tokenizations.tokenization_utils import DatasetEncoder
-from tokenizations.hypernet_cache import LRU_Cache
 
 # Global - for tracking purposes
 global total_old_tokens_used
@@ -112,7 +116,7 @@ def run_eval(
             get_answers_func(
                 model_path,
                 model_id,
-                questions[i : i + chunk_size],
+                questions[i: i + chunk_size],
                 answer_file,
                 max_new_token,
                 num_choices,
@@ -182,7 +186,7 @@ def apply_ngram_penalty(
 
     for token_id in range(logits.size(-1)):
         token = id2token[filtered_indices[token_id]]
-        potential_ngram = tuple(current_context[-(n - 1) :]) + (token,)
+        potential_ngram = tuple(current_context[-(n - 1):]) + (token,)
         if potential_ngram in ngram_set:
             logits[0][token_id] = -float("inf")
 
@@ -214,16 +218,7 @@ def generate_with_temperature(
     min_p: float = None,
     eos_bias: float = None,
     token2id: list = [],
-): 
-    print(
-        repetition_penalty,
-        pre_reorder_num_neighbors,
-        leaves_to_search,
-        temperature,
-        do_sample,
-        "eos_bias",
-        eos_bias,
-    )
+):
     global total_old_tokens_used
     global total_new_tokens_used
     vocab_init_path = "decoders/data/tokenizer_hn_mistral/vocab.json"
